@@ -1,0 +1,14 @@
+*.dex
+*.jar
+*.class
+__pycache__/
+build/
+data/
+config/config.sh
+config/miband.env
+tools/adbwire/out/
+*.log
+.DS_Store
+
+# local findings/scratch - not committed
+notes/

@@ -1,0 +1,26 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""mibandd — Mi Band 9 Active backend daemon + CLI.
+
+`mibandd serve` runs the long-lived backend (one authenticated BLE session,
+SQLite writer, request routing) on 127.0.0.1:8478. The same command is the CLI
+that drives it, so scripts can just call it:
+
+    mibandd serve --daemonize
+    mibandd store stats --json
+    mibandd health collect
+    mibandd health summary
+    mibandd device battery
+
+See docs/DAEMON.md.
+"""
+import os
+import sys
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from mibandd import main
+
+if __name__ == "__main__":
+    sys.exit(main())
