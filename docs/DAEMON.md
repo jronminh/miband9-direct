@@ -70,7 +70,8 @@ mibandd/
 - **Lazy auto-spawn**: a client that cannot connect spawns `mibandd` detached
   and polls for `ready`, so nothing is managed by hand.
 - **Idle-exit** after N minutes with no clients (default on); `--stay` +
-  `termux-wake-lock` keeps it warm for frequent sampling.
+  `termux-wake-lock` keeps it warm for frequent sampling. `mibandd automate
+  install` sets both up (plus a watchdog job) in one shot.
 - PID file and log under `~/.miband/`; logs mask the auth key.
 
 ## RPC contract

@@ -113,6 +113,10 @@ mibandd schedule remove                     # cancel it
 `install` writes `~/.miband/collect.sh` and registers it with
 `termux-job-scheduler`; output is appended to `~/.miband/collect.log`.
 
+`mibandd automate install` wraps this: it registers the same collector **and** a
+watchdog job (id 8802), holds the Termux wake lock, and keeps the backend warm
+with `serve --stay` so a scheduled run hits an already-authenticated session.
+
 Notes:
 
 - Android's minimum period is **15 minutes** (clamped up automatically).

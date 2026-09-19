@@ -116,6 +116,10 @@ Details/sleep files are listed by the band but never streamed — see
 mibandd key [--show]             # extract/save the auth key (ADB)
 mibandd schedule install --period-min 15   # Android JobScheduler collection
 mibandd schedule status | remove
+mibandd automate install [--period-min 15] # wake lock + warm session + watchdog
+mibandd automate status | stop
+mibandd forward install [--allow a,b --deny c --rate 20]  # phone -> band notifs
+mibandd forward status | stop
 mibandd watch --interval 60      # sample battery
 mibandd commands                 # list the command registry
 mibandd completion bash|zsh|fish # shell tab-completion
@@ -128,7 +132,24 @@ eval "$(mibandd completion bash)"              # tab-completion
 mibandd health summary --json | jq .fields.hr_resting
 mibandd store stats --json                     # one line, exit 0/1
 mibandd health collect --no-spawn              # fail if the daemon is down
+mibandd automate install                       # keep warm + collect + watchdog
 ```
+
+`automate install` acquires `termux-wake-lock`, starts `serve --stay
+--daemonize`, and registers two JobScheduler jobs: the collector (id 8801) and
+a watchdog (id 8802) that re-acquires the lock and re-spawns the backend if it
+dies. `automate status` is read-only; `automate stop` cancels both jobs, stops
+the backend and releases the lock. All output is JSON (`--json` for one line).
+
+`forward install` mirrors a subset of Android notifications to the band. Termux
+cannot read notifications (it runs as `untrusted_app`), so the loop captures
+them over the shell-UID ADB bridge (`dsh -c 'dumpsys notification --noredact'`),
+parses/dedups/filters them, and pushes new ones with `notify notify`. It holds
+the wake lock and registers a JobScheduler watchdog (id 8803) that restarts the
+loop if it dies. Defaults: poll every 4 s, importance >= 3, one push per package
+per 20 s; `--allow`/`--deny` take comma-separated package names. Logs:
+`~/.miband/notify-forward.log`, `.../notify-forward-watchdog.log`. `forward stop`
+cancels the job and stops the loop (it leaves the shared wake lock alone).
 
 Any script/language can speak the raw JSON-lines RPC on `127.0.0.1:8478`:
 

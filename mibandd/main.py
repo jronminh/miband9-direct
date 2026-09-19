@@ -8,7 +8,7 @@
     mibandd notify  notify|call|callend|dismiss
     mibandd health  list|collect|decode|summary|trend|blob
     mibandd store   history|samples|stats|files|blobs
-    mibandd key | schedule | watch | commands            (local utilities)
+    mibandd key | schedule | automate | watch | commands  (local utilities)
 
 The daemon subcommands talk to a running `mibandd serve` (auto-starting it if
 needed), so the same command works for one-offs and for scripts.
@@ -50,6 +50,38 @@ def _schedule_status(args):
 def _schedule_remove(args):
     from .setup import schedule_remove
     return schedule_remove()
+
+
+def _automate_install(args):
+    from .setup import automate_install
+    return automate_install(args.period_min, not args.no_persist, args.charging)
+
+
+def _automate_status(args):
+    from .setup import automate_status
+    return automate_status()
+
+
+def _automate_stop(args):
+    from .setup import automate_stop
+    return automate_stop()
+
+
+def _forward_install(args):
+    from .setup import forward_install
+    return forward_install(args.interval, args.allow, args.deny, args.rate,
+                           args.min_importance, args.period_min,
+                           not args.no_persist, args.charging)
+
+
+def _forward_status(args):
+    from .setup import forward_status
+    return forward_status()
+
+
+def _forward_stop(args):
+    from .setup import forward_stop
+    return forward_stop()
 
 
 def _commands(args):
@@ -129,6 +161,31 @@ def client_parser():
     install.add_argument("--charging", action="store_true")
     install.add_argument("--no-persist", action="store_true")
     install.set_defaults(fn=_schedule_install)
+
+    p = _local(sub, "automate", help="keep-warm session + uptime watchdog")
+    actions = p.add_subparsers(dest="action", required=True)
+    actions.add_parser("status").set_defaults(fn=_automate_status)
+    actions.add_parser("stop").set_defaults(fn=_automate_stop)
+    install = actions.add_parser("install")
+    install.add_argument("--period-min", type=float, default=15.0)
+    install.add_argument("--charging", action="store_true")
+    install.add_argument("--no-persist", action="store_true")
+    install.set_defaults(fn=_automate_install)
+
+    p = _local(sub, "forward", help="forward phone notifications to the band")
+    actions = p.add_subparsers(dest="action", required=True)
+    actions.add_parser("status").set_defaults(fn=_forward_status)
+    actions.add_parser("stop").set_defaults(fn=_forward_stop)
+    install = actions.add_parser("install")
+    install.add_argument("--interval", type=float, default=4.0)
+    install.add_argument("--allow", default="", help="comma-separated allowlist")
+    install.add_argument("--deny", default="", help="comma-separated denylist")
+    install.add_argument("--rate", type=float, default=20.0)
+    install.add_argument("--min-importance", type=int, default=3)
+    install.add_argument("--period-min", type=float, default=15.0)
+    install.add_argument("--charging", action="store_true")
+    install.add_argument("--no-persist", action="store_true")
+    install.set_defaults(fn=_forward_install)
 
     p = cli.add_client_flags(sub.add_parser("watch", help="sample battery"))
     p.add_argument("--interval", type=float, default=60.0)

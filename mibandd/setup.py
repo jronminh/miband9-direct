@@ -8,8 +8,10 @@ Android's JobScheduler.
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import time
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -20,6 +22,13 @@ JOB_ID = 8801
 JOB_DIR = os.path.join(os.path.expanduser("~"), ".miband")
 JOB_SCRIPT = os.path.join(JOB_DIR, "collect.sh")
 JOB_LOG = os.path.join(JOB_DIR, "collect.log")
+
+WATCHDOG_JOB_ID = 8802
+WATCHDOG_SCRIPT = os.path.join(JOB_DIR, "watchdog.sh")
+WATCHDOG_LOG = os.path.join(JOB_DIR, "watchdog.log")
+
+# Mirrors lifecycle.PID_FILE (kept here so this module stays import-light).
+DAEMON_PID = os.path.join(JOB_DIR, "mibandd.pid")
 
 
 def _adb_path():
@@ -74,6 +83,29 @@ def _need_scheduler():
             "termux-job-scheduler not found (install Termux:API and grant it)")
 
 
+def _need_termux_tool(name):
+    found = shutil.which(name)
+    if not found:
+        raise ValueError(f"{name} not found (install Termux:API and grant it)")
+    return found
+
+
+def _register_job(job_id, script, period_min=15.0, persisted=True,
+                  charging=False):
+    """Register one script with Android's JobScheduler (15-min floor)."""
+    _need_scheduler()
+    period_ms = max(900_000, int(period_min * 60_000))
+    subprocess.run(
+        ["termux-job-scheduler", "--script", script,
+         "--job-id", str(job_id), "--period-ms", str(period_ms),
+         "--battery-not-low", "true",
+         "--persisted", "true" if persisted else "false",
+         "--charging", "true" if charging else "false"],
+        check=True)
+    return {"job_id": job_id, "script": script, "period_min": period_ms / 60000,
+            "persisted": persisted, "charging": charging}
+
+
 def _job_script_body():
     daemon = os.path.join(_ROOT, "bin", "mibandd")
     return (
@@ -88,22 +120,13 @@ def _job_script_body():
 
 def schedule_install(period_min=15.0, persisted=True, charging=False):
     """Write the collector wrapper and register it with Android's JobScheduler."""
-    _need_scheduler()
     os.makedirs(JOB_DIR, exist_ok=True)
     with open(JOB_SCRIPT, "w") as fh:
         fh.write(_job_script_body())
     os.chmod(JOB_SCRIPT, 0o700)
-    period_ms = max(900_000, int(period_min * 60_000))  # Android's 15-min floor
-    subprocess.run(
-        ["termux-job-scheduler", "--script", JOB_SCRIPT,
-         "--job-id", str(JOB_ID), "--period-ms", str(period_ms),
-         "--battery-not-low", "true",
-         "--persisted", "true" if persisted else "false",
-         "--charging", "true" if charging else "false"],
-        check=True)
-    return {"job_id": JOB_ID, "script": JOB_SCRIPT, "log": JOB_LOG,
-            "period_min": period_ms / 60000, "persisted": persisted,
-            "charging": charging}
+    info = _register_job(JOB_ID, JOB_SCRIPT, period_min, persisted, charging)
+    info["log"] = JOB_LOG
+    return info
 
 
 def schedule_status():
@@ -120,3 +143,283 @@ def schedule_remove():
     subprocess.run(["termux-job-scheduler", "--cancel", "--job-id", str(JOB_ID)],
                    check=False)
     return {"job_id": JOB_ID, "cancelled": True}
+
+
+# ------------------------------------------------------------- automation
+def wake_lock():
+    """Acquire the Termux wake lock (idempotent)."""
+    subprocess.run([_need_termux_tool("termux-wake-lock")], check=True)
+    return {"wake_lock": True}
+
+
+def wake_unlock():
+    """Release the Termux wake lock (idempotent)."""
+    subprocess.run([_need_termux_tool("termux-wake-unlock")], check=True)
+    return {"wake_lock": False}
+
+
+def _daemon_path():
+    return os.path.join(_ROOT, "bin", "mibandd")
+
+
+def daemon_pid():
+    """The PID recorded by the running backend, or None."""
+    try:
+        with open(DAEMON_PID) as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def daemon_alive():
+    pid = daemon_pid()
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def warm_daemon(wait=5.0):
+    """Start `mibandd serve --stay --daemonize` if it is not already up."""
+    if daemon_alive():
+        return {"pid": daemon_pid(), "started": False, "alive": True}
+    subprocess.Popen([sys.executable, _daemon_path(), "serve",
+                      "--stay", "--daemonize"],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     stdin=subprocess.DEVNULL, start_new_session=True)
+    deadline = time.time() + wait
+    while time.time() < deadline and not daemon_alive():
+        time.sleep(0.2)
+    return {"pid": daemon_pid(), "started": True, "alive": daemon_alive()}
+
+
+def _shutdown_daemon():
+    """Ask the backend to stop, falling back to SIGTERM."""
+    from . import client
+    pid = daemon_pid()
+    if pid is None:
+        return {"pid": None, "stopped": False}
+    try:
+        client.call("", "shutdown", spawn=False, timeout=5.0)
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            return {"pid": pid, "stopped": False}
+    return {"pid": pid, "stopped": True}
+
+
+def _watchdog_script_body():
+    daemon = os.path.join(_ROOT, "bin", "mibandd")
+    return (
+        "#!/data/data/com.termux/files/usr/bin/bash\n"
+        "# Generated by `mibandd automate install` - do not edit.\n"
+        "# Re-acquires the wake lock and restarts the warm backend if it died.\n"
+        f"exec >> {shlex.quote(WATCHDOG_LOG)} 2>&1\n"
+        "ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }\n"
+        "termux-wake-lock 2>/dev/null || true\n"
+        f"pid_file={shlex.quote(DAEMON_PID)}\n"
+        "if [ -f \"$pid_file\" ] && kill -0 \"$(cat \"$pid_file\")\" 2>/dev/null; "
+        "then\n"
+        "    echo \"$(ts) ok pid=$(cat \"$pid_file\")\"\n"
+        "else\n"
+        f"    {shlex.quote(sys.executable)} {shlex.quote(daemon)} "
+        "serve --stay --daemonize\n"
+        "    echo \"$(ts) respawned\"\n"
+        "fi\n"
+    )
+
+
+def watchdog_install(period_min=15.0, persisted=True, charging=False):
+    """Write the watchdog wrapper and register it with the JobScheduler."""
+    os.makedirs(JOB_DIR, exist_ok=True)
+    with open(WATCHDOG_SCRIPT, "w") as fh:
+        fh.write(_watchdog_script_body())
+    os.chmod(WATCHDOG_SCRIPT, 0o700)
+    info = _register_job(WATCHDOG_JOB_ID, WATCHDOG_SCRIPT, period_min,
+                         persisted, charging)
+    info["log"] = WATCHDOG_LOG
+    return info
+
+
+def watchdog_status():
+    _need_scheduler()
+    out = subprocess.run(["termux-job-scheduler", "--pending"],
+                         capture_output=True, text=True)
+    return {"job_id": WATCHDOG_JOB_ID, "script": WATCHDOG_SCRIPT,
+            "log": WATCHDOG_LOG,
+            "script_exists": os.path.exists(WATCHDOG_SCRIPT),
+            "pending": out.stdout.strip() or out.stderr.strip()}
+
+
+def watchdog_remove():
+    _need_scheduler()
+    subprocess.run(
+        ["termux-job-scheduler", "--cancel", "--job-id", str(WATCHDOG_JOB_ID)],
+        check=False)
+    return {"job_id": WATCHDOG_JOB_ID, "cancelled": True}
+
+
+def automate_install(period_min=15.0, persisted=True, charging=False):
+    """Keep the session warm and Termux alive: wake lock + collect + watchdog."""
+    locked = wake_lock()
+    daemon = warm_daemon()
+    collect = schedule_install(period_min, persisted, charging)
+    watchdog = watchdog_install(period_min, persisted, charging)
+    return {"wake_lock": locked["wake_lock"], "daemon": daemon,
+            "collect": collect, "watchdog": watchdog}
+
+
+def automate_status():
+    """Read-only view of the automation state."""
+    return {"daemon": {"pid": daemon_pid(), "alive": daemon_alive()},
+            "collect": schedule_status(), "watchdog": watchdog_status()}
+
+
+def automate_stop():
+    """Cancel both jobs, stop the backend and release the wake lock."""
+    watchdog_remove()
+    schedule_remove()
+    daemon = _shutdown_daemon()
+    unlocked = wake_unlock()
+    return {"collect_cancelled": True, "watchdog_cancelled": True,
+            "daemon": daemon, "wake_lock": unlocked["wake_lock"]}
+
+
+# --------------------------------------------------- notification forwarding
+FORWARD_JOB_ID = 8803
+FORWARD_SCRIPT = os.path.join(JOB_DIR, "notify-forward.sh")
+FORWARD_WATCHDOG_SCRIPT = os.path.join(JOB_DIR, "notify-forward-watchdog.sh")
+FORWARD_LOG = os.path.join(JOB_DIR, "notify-forward.log")
+FORWARD_WATCHDOG_LOG = os.path.join(JOB_DIR, "notify-forward-watchdog.log")
+FORWARD_PID = os.path.join(JOB_DIR, "notify-forward.pid")
+FORWARD_STATE = os.path.join(JOB_DIR, "notify-seen.json")
+FORWARDER = os.path.join(_ROOT, "tools", "notify-forward.py")
+
+
+def _forward_pid():
+    try:
+        with open(FORWARD_PID) as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _forward_alive():
+    pid = _forward_pid()
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _forward_script_body(interval, allow, deny, rate, min_importance, state):
+    args = [shlex.quote(sys.executable), "-u", shlex.quote(FORWARDER),
+            "--loop", "--interval", str(interval),
+            "--pidfile", shlex.quote(FORWARD_PID),
+            "--state", shlex.quote(state),
+            "--rate", str(rate),
+            "--min-importance", str(min_importance)]
+    if allow:
+        args += ["--allow", shlex.quote(allow)]
+    if deny:
+        args += ["--deny", shlex.quote(deny)]
+    return (
+        "#!/data/data/com.termux/files/usr/bin/bash\n"
+        "# Generated by `mibandd forward install` - do not edit.\n"
+        "# Captures Android notifications over the shell-UID bridge (dsh)\n"
+        "# and pushes new ones to the band; output is appended to the log.\n"
+        f"exec >> {shlex.quote(FORWARD_LOG)} 2>&1\n"
+        "ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }\n"
+        "termux-wake-lock 2>/dev/null || true\n"
+        "echo \"$(ts) starting\"\n"
+        "exec " + " ".join(args) + "\n"
+    )
+
+
+def _forward_watchdog_body():
+    return (
+        "#!/data/data/com.termux/files/usr/bin/bash\n"
+        "# Generated by `mibandd forward install` - do not edit.\n"
+        "# Restarts the notification forwarder if it died.\n"
+        f"exec >> {shlex.quote(FORWARD_WATCHDOG_LOG)} 2>&1\n"
+        "ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }\n"
+        "termux-wake-lock 2>/dev/null || true\n"
+        f"pid_file={shlex.quote(FORWARD_PID)}\n"
+        "if [ -f \"$pid_file\" ] && kill -0 \"$(cat \"$pid_file\")\" 2>/dev/null; "
+        "then\n"
+        "    echo \"$(ts) ok pid=$(cat \"$pid_file\")\"\n"
+        "else\n"
+        f"    nohup {shlex.quote(FORWARD_SCRIPT)} >/dev/null 2>&1 &\n"
+        "    echo \"$(ts) respawned\"\n"
+        "fi\n"
+    )
+
+
+def forward_start():
+    """Start the forwarder now (the watchdog does this later)."""
+    if _forward_alive():
+        return {"pid": _forward_pid(), "started": False, "alive": True}
+    subprocess.Popen([FORWARD_SCRIPT], stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                     start_new_session=True)
+    deadline = time.time() + 5.0
+    while time.time() < deadline and not _forward_alive():
+        time.sleep(0.2)
+    return {"pid": _forward_pid(), "started": True, "alive": _forward_alive()}
+
+
+def forward_install(interval=4.0, allow="", deny="", rate=20.0,
+                    min_importance=3, period_min=15.0, persisted=True,
+                    charging=False):
+    """Write the forwarder + watchdog wrappers and register the watchdog."""
+    if not os.path.exists(FORWARDER):
+        raise ValueError(f"forwarder not found: {FORWARDER}")
+    os.makedirs(JOB_DIR, exist_ok=True)
+    with open(FORWARD_SCRIPT, "w") as fh:
+        fh.write(_forward_script_body(interval, allow, deny, rate,
+                                      min_importance, FORWARD_STATE))
+    os.chmod(FORWARD_SCRIPT, 0o700)
+    with open(FORWARD_WATCHDOG_SCRIPT, "w") as fh:
+        fh.write(_forward_watchdog_body())
+    os.chmod(FORWARD_WATCHDOG_SCRIPT, 0o700)
+    locked = wake_lock()
+    job = _register_job(FORWARD_JOB_ID, FORWARD_WATCHDOG_SCRIPT, period_min,
+                        persisted, charging)
+    started = forward_start()
+    return {"wake_lock": locked["wake_lock"], "job": job, "started": started,
+            "log": FORWARD_LOG, "watchdog_log": FORWARD_WATCHDOG_LOG}
+
+
+def forward_status():
+    """Read-only view of the forwarder state."""
+    _need_scheduler()
+    out = subprocess.run(["termux-job-scheduler", "--pending"],
+                         capture_output=True, text=True)
+    return {"pid": _forward_pid(), "alive": _forward_alive(),
+            "script": FORWARD_SCRIPT,
+            "script_exists": os.path.exists(FORWARD_SCRIPT),
+            "log": FORWARD_LOG, "job_id": FORWARD_JOB_ID,
+            "pending": out.stdout.strip() or out.stderr.strip()}
+
+
+def forward_stop():
+    """Cancel the watchdog job and stop the forwarder."""
+    _need_scheduler()
+    subprocess.run(
+        ["termux-job-scheduler", "--cancel", "--job-id", str(FORWARD_JOB_ID)],
+        check=False)
+    pid = _forward_pid()
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    return {"job_id": FORWARD_JOB_ID, "cancelled": True, "pid": pid,
+            "stopped": True}
