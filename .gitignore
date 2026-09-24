@@ -9,6 +9,9 @@ config/miband.env
 tools/adbwire/out/
 *.log
 .DS_Store
+*.jks
+*.apk
+*.apk.idsig
 
 # local findings/scratch - not committed
 notes/

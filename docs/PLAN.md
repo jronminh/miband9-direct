@@ -70,6 +70,68 @@ session, store, decode and scheduler; per-field thin clients drive it.
 - [ ] `termux-opencode-job` recipe for periodic sync.
 - [ ] Error handling, timeouts, reconnect.
 
+## Phase 5 — Headless companion app (stability path)
+
+Motivation: the shell-UID `app_process` route is inherently unstable — it needs
+a live ADB / Wireless Debugging link (the `dsh` daemon dies independently), the
+daemon does not survive a reboot, and it fights Mi Fitness for the single login.
+A real app process owns the radio with normal permissions and a foreground
+service, so it survives reboots and drops the ADB dependency entirely — while
+staying Termux-compatible.
+
+Design: **Termux keeps the intelligence, the app keeps the radio.** The app has
+no launcher entry and no custom UI — **Termux is the launcher** (`am start`).
+It exposes the *same* loopback line protocol, so `mibandd` and `client/` are
+unchanged.
+
+Implemented in `app/` — built and signed to `app/mibandbridge.apk`.
+
+- [x] **Reuse the transport.** Moved into a `Service`: the GATT callbacks, write
+      serialization and the `127.0.0.1:8477` server are unchanged
+      (`app/src/dev/miband/bridge/BleService.java`).
+- [x] **Swap the bootstrap.** `main()`'s shell-UID hack is gone;
+      `Service.onCreate()` gets `BLUETOOTH_SERVICE` normally, starts the server
+      and calls `startForeground`.
+- [x] **Manifest:** legacy `BLUETOOTH` / `BLUETOOTH_ADMIN` (maxSdk 30) plus
+      `BLUETOOTH_CONNECT` / `SCAN`, `FOREGROUND_SERVICE`, `RECEIVE_BOOT_COMPLETED`,
+      `WAKE_LOCK`, `INTERNET` (loopback TCP needs it). No `LAUNCHER` category →
+      never appears in the app drawer.
+- [x] **One-time `pm grant`.** On this Android 16 device `targetSdk 30` does
+      **not** exempt the modern permission — `connectGatt` threw
+      `SecurityException: Need android.permission.BLUETOOTH_CONNECT`. So grant
+      once over `dsh` after install:
+      `pm grant dev.miband.bridge android.permission.BLUETOOTH_CONNECT` (and
+      `...BLUETOOTH_SCAN`). Still no runtime dialog and no UI — but it is a
+      setup step, not zero-config as first hoped.
+- [x] **Package + sign** with `aapt2` / `d8` / `apksigner` / `zipalign` — no
+      gradle, no Android SDK. Build: `bash app/build.sh`.
+- [x] **Install + verify** — done. `pm install -r`, grant the two BT perms,
+      launch `dev.miband.bridge/.PermitActivity --es mac <MAC>`. The service
+      reports `state=ready` on `127.0.0.1:8477` and `mibandd device battery`
+      returned live data (`{"level": 61, "state": 2}`) with the shell-UID BLE
+      daemon stopped. **Reboot-survival confirmed**: after a device reboot the
+      service is back at `state=ready` and `mibandd device battery` works with
+      `dsh` down.
+- [ ] **Optional / parked: patch termux-app for `termux-am`.** The release
+      build (v0.119.0-beta.3) has the am socket server commented out, so
+      `termux-am` cannot work and updating does not help (latest official =
+      installed version; no nightly; other APKs are signed with a different key
+      → uninstall → wipe). The only route is a master build with that block
+      uncommented, self-signed, shipped with a `~` + `$PREFIX`
+      backup/uninstall/restore procedure. Not now — `am` is used instead. See
+      [`COMPANION-APP.md`](COMPANION-APP.md).
+
+Known costs (accepted):
+
+1. **Persistent notification** — a foreground service must post one (silent,
+   low-priority, minimizable). Truly invisible is not possible on modern
+   Android; this is the price of dropping ADB.
+2. **Samsung battery management** — on this S23 FE the app must be exempted
+   from battery optimization (or at least allowed to auto-start), or the
+   service gets frozen.
+
+Outcome: stable, reboot-surviving, Termux-compatible — no `dsh`, no shell UID.
+
 ## Risks / unknowns
 
 1. **app_process + BluetoothGatt on Android 16** — unproven. Spike decides.
@@ -82,6 +144,7 @@ session, store, decode and scheduler; per-field thin clients drive it.
 
 ## Fallbacks (in order)
 
-1. Tiny custom bridge app exposing BLE to Termux (same protocol port).
+1. Headless companion app exposing BLE to Termux (same protocol port) — now
+   promoted to [Phase 5](#phase-5--headless-companion-app-stability-path).
 2. Termux:API BLE fork.
 3. Gadgetbridge + Intent API (already built in `../miband9-termux`).
